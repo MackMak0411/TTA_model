@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.venv/
+venv/
+
+# Local data and generated outputs
+datasets/
+checkpoints/
+results/
+wandb/
+
+# Downloaded/pretrained model files
+pretrained/
+*.pth
+*.pt
+*.ckpt
+
+# Local environment and editor files
+.env
+.vscode/
+*.log

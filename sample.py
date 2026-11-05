@@ -1,0 +1,144 @@
+from __future__ import annotations
+
+import argparse
+from pathlib import Path
+
+import soundfile
+import torch
+
+from train import get_audio_encoder, get_model, get_tokenizer
+from TTA.utils import parse_yaml
+
+
+def sample(args):
+
+    # Arguments
+    config_path = args.config
+    ckpt_path = args.ckpt_path
+    ckpt_steps = int(Path(ckpt_path).stem.split("=", 1)[1])
+
+    # Configs
+    configs = parse_yaml(config_path)
+
+    num_samples = 1  # Number of samples to draw
+    temperature = 1.0  # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
+    top_k = 200  # Retain only the top_k most likely tokens, clamp others to have 0 probability
+    
+    device = "cuda"
+    sr = configs["sample_rate"]
+
+    # Audio encoder
+    audio_encoder = get_audio_encoder(configs).to(device)
+
+    # Tokenizer
+    tokenizer = get_tokenizer(configs, audio_encoder)
+
+    # Model
+    model = get_model(
+        configs=configs, 
+        vocab_size=len(tokenizer), 
+        ckpt_path=ckpt_path
+    ).to(device)
+    
+    # Users can change the captions here
+    captions = sample_captions(configs)
+
+    for caption in captions:
+
+        batch_caption = [caption]
+
+        # Tokenize captions to IDs
+        caption_ids = tokenizer.captions_to_ids(
+            captions=batch_caption, 
+            fix_length=configs["max_caption_len"]
+        ).to(device)  # (b, l_text)
+
+        # Begin of audio ID
+        B = caption_ids.shape[0]
+        audio_ids = torch.ones(size=(B, 1), dtype=torch.long, device=device) * tokenizer.boa_token_id
+
+        # Concatenate text prompt IDs and audio IDs
+        input_ids = torch.cat((caption_ids, audio_ids), dim=1)
+
+        # Sample    
+        for n in range(num_samples):
+
+            with torch.no_grad():
+                model.eval()
+                # block_size is the total context length, not the number of
+                # audio tokens. Keep generation inside the model context and
+                # stop when the model emits the end-of-audio token.
+                max_new_ids = max(1, model.block_size - input_ids.shape[1])
+                ids = model.generate(
+                    ids=input_ids, 
+                    max_new_ids=max_new_ids, 
+                    temperature=temperature, 
+                    top_k=top_k,
+                    stop_token_id=tokenizer.eoa_token_id
+                )  # (b, l)
+            
+            audio_codes = tokenizer.ids_to_audio_codes(ids)  # (b, t, q)
+            if audio_codes.shape[1] == 0:
+                raise RuntimeError(
+                    f"No complete audio code frames were generated for caption: {caption!r}. "
+                    "The checkpoint may not have learned to emit audio tokens yet."
+                )
+
+            audio = audio_encoder.decode(audio_codes)  # shape: (b, c, l)
+
+            peak = float(audio.abs().amax().item())
+            if peak < 1e-6:
+                raise RuntimeError(
+                    f"The decoded audio is silent for caption: {caption!r} "
+                    f"(peak amplitude={peak:.3g})."
+                )
+
+            # DAC can return a valid but very quiet waveform when the sampled
+            # code sequence has low energy. Normalize only the output level;
+            # this does not change the generated waveform's content.
+            audio = audio * (0.95 / peak)
+            audio = audio.cpu().numpy()[0]  # shape: (c, t)
+
+            # print(n)
+            for b in range(B):
+                results_dir = Path("./results", Path(config_path).stem)
+                results_dir.mkdir(parents=True, exist_ok=True)
+                audios_path = Path(results_dir, "New_{}_sample_{} steps_{}.wav".format(caption, ckpt_steps, n))
+                soundfile.write(file=audios_path, data=audio.T, samplerate=sr)
+                print("Write out to {} (original peak amplitude: {:.3g})".format(audios_path, peak))
+
+
+
+
+def sample_captions(configs: dict) -> list[str]:
+
+    if "Clotho" in configs["development_datasets"]:
+
+        # Input captions immdiately for testing
+        captions = [
+            "Several birds are chirping and singing outdoors.",
+            "A train horn sounds during heavy rainfall.",
+            "A door opens and closes with a loud squeak.",
+            "A person is typing on a computer keyboard.",
+            "A vehicle engine starts and then gradually speeds up.",
+            "Metal objects clang together in a noisy room."
+        ]
+        
+        # Input captions from user later
+        # print("Please input captions (separated by comma):")
+        # get_captions = input()
+        # captions = get_captions.split(",")
+
+    else:
+        raise NotImplementedError
+
+    return captions
+
+if __name__ == "__main__":
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", type=str, required=True, help="Path of config yaml.")
+    parser.add_argument('--ckpt_path', type=str, required=True)
+    args = parser.parse_args()
+
+    sample(args)
