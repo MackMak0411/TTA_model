@@ -103,7 +103,7 @@ def sample(args):
             for b in range(B):
                 results_dir = Path("./results", Path(config_path).stem)
                 results_dir.mkdir(parents=True, exist_ok=True)
-                audios_path = Path(results_dir, "New_{}_sample_{} steps_{}.wav".format(caption, ckpt_steps, n))
+                audios_path = Path(results_dir, "{}_sample_{} steps_{}.wav".format(caption, ckpt_steps, n))
                 soundfile.write(file=audios_path, data=audio.T, samplerate=sr)
                 print("Write out to {} (original peak amplitude: {:.3g})".format(audios_path, peak))
 
@@ -120,8 +120,6 @@ def sample_captions(configs: dict) -> list[str]:
             "A train horn sounds during heavy rainfall.",
             "A door opens and closes with a loud squeak.",
             "A person is typing on a computer keyboard.",
-            "A vehicle engine starts and then gradually speeds up.",
-            "Metal objects clang together in a noisy room."
         ]
         
         # Input captions from user later

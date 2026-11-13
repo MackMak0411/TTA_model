@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import re
 from pathlib import Path
 
 import numpy as np
@@ -28,6 +29,9 @@ def train(args) -> None:
     # Configs
     configs = parse_yaml(config_path)
     device = configs["train"]["device"]
+    resume_ckpt_path = configs["train"]["resume_ckpt_path"]
+    save_ckpt_steps = configs["train"]["save_every_n_steps"]
+    resume_step = get_checkpoint_step(resume_ckpt_path, save_ckpt_steps)
 
     # Checkpoints directory
     config_name = Path(config_path).stem
@@ -60,7 +64,7 @@ def train(args) -> None:
     model = get_model(
         configs=configs, 
         vocab_size=len(tokenizer), 
-        ckpt_path=configs["train"]["resume_ckpt_path"]
+        ckpt_path=resume_ckpt_path
     ).to(device)
 
     # Optimizer
@@ -68,12 +72,23 @@ def train(args) -> None:
         configs=configs, 
         params=model.parameters()
     )
+    # Enable mixed precision only when requested and running on a CUDA device.
+    mixed_precision_enabled = (
+        configs["train"].get("mixed_precision", False)
+        and device.startswith("cuda")
+    )
+    # GradScaler keeps FP16 gradients numerically stable.
+    scaler = torch.amp.GradScaler("cuda", enabled=mixed_precision_enabled)
 
     if wandb_log:
         wandb.init(project="TTA", name=config_name)
 
     # Train
-    for step, data in enumerate(tqdm(train_dataloader)):
+    progress = tqdm(
+        train_dataloader,
+        initial=max(resume_step, 0)
+    )
+    for step, data in enumerate(progress, start=resume_step):
 
         # ------ 1. Data preparation ------
         # 1.1 Prepare audio and captions
@@ -98,25 +113,43 @@ def train(args) -> None:
         # ------ 2. Training ------
         # 2.1 Forward
         model.train()
-        logits = model(ids)  # shape: (b, l, v)
+        if mixed_precision_enabled:
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                logits = model(ids)  # shape: (b, l, v)
+                out = logits[:, 0 : -1, :]
+                target_ids = ids[:, 1 :]
+                mask = get_loss_mask(caption_ids, audio_ids[:, 0: -1])
+                loss = ce_loss(
+                    output=out,
+                    target=target_ids,
+                    mask=mask,
+                    ignore_index=tokenizer.pad_token_id
+                )
 
-        # 2.2 Targets
-        out = logits[:, 0 : -1, :]
-        target_ids = ids[:, 1 :]
-        mask = get_loss_mask(caption_ids, audio_ids[:, 0: -1])  # (b, l)
+            optimizer.zero_grad()
+            scaler.scale(loss).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            logits = model(ids)  # shape: (b, l, v)
 
-        # 2.3 Loss
-        loss = ce_loss(
-            output=out, 
-            target=target_ids, 
-            mask=mask, 
-            ignore_index=tokenizer.pad_token_id
-        )
-        
-        # 2.4 Optimize
-        optimizer.zero_grad()  # Reset all parameter.grad to 0
-        loss.backward()  # Update all parameter.grad
-        optimizer.step()  # Update all parameters based on all parameter.grad
+            # 2.2 Targets
+            out = logits[:, 0 : -1, :]
+            target_ids = ids[:, 1 :]
+            mask = get_loss_mask(caption_ids, audio_ids[:, 0: -1])  # (b, l)
+
+            # 2.3 Loss
+            loss = ce_loss(
+                output=out, 
+                target=target_ids, 
+                mask=mask, 
+                ignore_index=tokenizer.pad_token_id
+            )
+
+            # 2.4 Optimize
+            optimizer.zero_grad()  # Reset all parameter.grad to 0
+            loss.backward()  # Update all parameter.grad
+            optimizer.step()  # Update all parameters based on all parameter.grad
 
         # 2.5 Learning rate scheduler
         if scheduler:
@@ -152,13 +185,33 @@ def train(args) -> None:
             print("Test loss: {:.2f}".format(test_loss))
 
         # 3.2 Save model
-        if step % configs["train"]["save_every_n_steps"] == 0:
+        if step % save_ckpt_steps == 0:
             ckpt_path = Path(ckpts_dir, f"step={step}.pth")
             torch.save(model.state_dict(), ckpt_path)
             print(f"Save model to {ckpt_path}")
 
         if step == configs["train"]["training_steps"]:
             break
+
+
+def get_checkpoint_step(
+    ckpt_path: str | None,
+    save_ckpt_steps: int
+    ) -> int:
+    r"""Read the global training step from a checkpoint filename."""
+
+    if not ckpt_path:
+        return -1
+
+    checkpoint_name = Path(ckpt_path).stem
+    ckpt_step = re.search(r"\d+", checkpoint_name)
+    ckpt_step = int(ckpt_step.group()) if ckpt_step else None
+    if ckpt_step is None or ckpt_step % save_ckpt_steps != 0:
+        raise ValueError(
+            "Invalid resume_ckpt_path."
+        )
+
+    return int(ckpt_step)
 
         
 def get_dataset(
