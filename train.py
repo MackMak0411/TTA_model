@@ -37,10 +37,11 @@ def train(args) -> None:
     config_name = Path(config_path).stem
     ckpts_dir = Path("./checkpoints", filename, config_name)
     Path(ckpts_dir).mkdir(parents=True, exist_ok=True)
+    loss_log_path = Path(ckpts_dir, "losses.txt")
 
     # Datasets
     train_dataset = get_dataset(configs, split="development")
-    test_dataset = get_dataset(configs, split="evaluation")
+    test_dataset = get_dataset(configs, split="validation")
 
     # Sampler
     train_sampler = InfiniteSampler(train_dataset)
@@ -189,6 +190,13 @@ def train(args) -> None:
             ckpt_path = Path(ckpts_dir, f"step={step}.pth")
             torch.save(model.state_dict(), ckpt_path)
             print(f"Save model to {ckpt_path}")
+            with loss_log_path.open("a", encoding="utf-8") as loss_file:
+                loss_file.write(
+                    f"{step} steps\n"
+                    f"train loss: {train_loss:.4f}\n"
+                    f"test loss: {test_loss:.4f}\n"
+                    "\n"
+                )
 
         if step == configs["train"]["training_steps"]:
             break
