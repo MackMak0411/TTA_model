@@ -20,14 +20,18 @@ CLAP_SAMPLE_RATE = 48000
 def clap_score(
     processor: ClapProcessor,
     clap_model: ClapModel,
-    audio: torch.Tensor,
+    audio: torch.Tensor | np.ndarray,
     caption: str,
     sample_rate: int,
     device: str,
 ) -> float:
     """Return cosine similarity between generated audio and its caption."""
 
-    audio = audio.detach().float().cpu().flatten()
+    if isinstance(audio, torch.Tensor):
+        audio = audio.detach().float().cpu()
+    else:
+        audio = torch.as_tensor(audio, dtype=torch.float32)
+    audio = audio.flatten()
     if sample_rate != CLAP_SAMPLE_RATE:
         audio = torchaudio.functional.resample(
             audio, sample_rate, CLAP_SAMPLE_RATE
